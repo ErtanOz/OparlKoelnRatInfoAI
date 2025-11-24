@@ -1,62 +1,132 @@
+
 import { GoogleGenAI } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+// Initialize with a fallback to avoid crash on init if key is missing, 
+// but validate before usage inside the function.
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || 'DUMMY_KEY' });
 
 export interface Attachment {
   url: string;
   mimeType: string;
 }
 
+// Proxy to bypass CORS restrictions on government servers for client-side demos
+const CORS_PROXY = 'https://corsproxy.io/?';
+const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB Limit to prevent browser crashes
+
 async function fetchFileAsBase64(url: string): Promise<string> {
-  // Note: This relies on the file server supporting CORS. 
-  // If the server denies cross-origin requests, this fetch will fail.
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Failed to fetch ${url}`);
+  let response: Response | undefined;
+  let fetchError: any;
+
+  // 1. Attempt Direct Fetch (fastest, but likely to fail due to CORS on external servers)
+  try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000); // Short timeout for direct fetch
+      response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+  } catch (e) {
+      fetchError = e;
+  }
+
+  // 2. Fallback to CORS Proxy if direct fetch failed or wasn't ok (e.g. opaque response)
+  if (!response || !response.ok) {
+      try {
+          // Encode the target URL component
+          const proxyUrl = `${CORS_PROXY}${encodeURIComponent(url)}`;
+          response = await fetch(proxyUrl);
+      } catch (proxyError) {
+          console.warn(`Proxy fetch failed for ${url}`, proxyError);
+          // Throw the original error if available to keep context, or the proxy error
+          throw new Error(`Download fehlgeschlagen: ${fetchError?.message || 'Netzwerkfehler/CORS'}`);
+      }
+  }
+
+  if (!response || !response.ok) {
+      throw new Error(`Server antwortete mit Status ${response?.status || 'Unknown'}`);
+  }
+
+  // 3. Check Content-Length Header (if available) before downloading body
+  const contentLength = response.headers.get('content-length');
+  if (contentLength && parseInt(contentLength) > MAX_FILE_SIZE_BYTES) {
+      throw new Error(`Datei zu groß (${(parseInt(contentLength) / 1024 / 1024).toFixed(1)} MB). Limit: 10 MB.`);
+  }
+
+  // 4. Download Blob and double check size
   const blob = await response.blob();
+  if (blob.size > MAX_FILE_SIZE_BYTES) {
+      throw new Error(`Datei zu groß (${(blob.size / 1024 / 1024).toFixed(1)} MB). Limit: 10 MB.`);
+  }
+
+  // 5. Convert to Base64
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {
-        // reader.result is like "data:application/pdf;base64,....."
         const result = reader.result as string;
+        // result is "data:application/pdf;base64,....."
         const base64 = result.split(',')[1];
-        resolve(base64);
+        if (base64) resolve(base64);
+        else reject(new Error("Fehler bei der Base64-Konvertierung"));
     };
-    reader.onerror = reject;
+    reader.onerror = () => reject(new Error("Fehler beim Lesen der Datei"));
     reader.readAsDataURL(blob);
   });
 }
 
 export async function askGemini(prompt: string, attachments: Attachment[] = []): Promise<string> {
+  if (!process.env.API_KEY) {
+    return "⚠️ **Konfigurationsfehler**: Kein API-Key gefunden. Bitte setzen Sie die Umgebungsvariable `API_KEY`.";
+  }
+
   try {
     const parts: any[] = [{ text: prompt }];
 
-    // Process attachments
-    for (const file of attachments) {
-        // Only support PDF and Images for now as they are most common and supported by Gemini
+    // Fetch attachments in parallel for speed, but handle failures individually
+    // ensuring one failed file doesn't crash the whole request
+    const attachmentPromises = attachments.map(async (file) => {
         if (file.mimeType === 'application/pdf' || file.mimeType.startsWith('image/')) {
             try {
                 const base64Data = await fetchFileAsBase64(file.url);
-                parts.push({
+                return {
                     inlineData: {
                         mimeType: file.mimeType,
                         data: base64Data
                     }
-                });
-            } catch (e) {
-                console.warn(`Could not fetch attachment ${file.url}:`, e);
-                // Inform the model that a file was missing
-                parts.push({ text: `[System Hinweis: Der Anhang ${file.url} konnte nicht heruntergeladen werden.]` });
+                };
+            } catch (e: any) {
+                console.warn(`Skipping attachment ${file.url}: ${e.message}`);
+                // Add a system note so the AI knows the file is missing and why
+                return { text: `\n> *System-Hinweis: Der Anhang [${file.url.split('/').pop()}] konnte nicht verarbeitet werden. Grund: ${e.message}*` };
             }
         }
-    }
+        return null;
+    });
+
+    const processedAttachments = (await Promise.all(attachmentPromises)).filter(Boolean);
+    parts.push(...processedAttachments);
 
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: { parts },
     });
-    return response.text || "Keine Antwort erhalten.";
-  } catch (error) {
-    console.error("Gemini Error:", error);
-    return "Entschuldigung, ich konnte keine Verbindung zu Gemini herstellen oder die Dokumente verarbeiten. Möglicherweise sind die Dateien zu groß oder durch Sicherheitseinstellungen geschützt.";
+
+    return response.text || "Keine Antwort vom Modell erhalten.";
+
+  } catch (error: any) {
+    console.error("Gemini Request Error:", error);
+    
+    // User-friendly error mapping
+    let userMessage = "Es ist ein unerwarteter Fehler aufgetreten.";
+    
+    if (error.message?.includes('403') || error.message?.includes('API key')) {
+        userMessage = "Der API-Schlüssel ist ungültig oder hat keine Berechtigung.";
+    } else if (error.message?.includes('429')) {
+        userMessage = "Das Anfragelimit wurde erreicht (Quota Exceeded). Bitte versuchen Sie es später erneut.";
+    } else if (error.message?.includes('500') || error.message?.includes('503')) {
+        userMessage = "Der AI-Dienst ist derzeit nicht erreichbar. Bitte versuchen Sie es später erneut.";
+    } else if (error.message?.includes('fetch')) {
+         userMessage = "Verbindungsfehler beim Abrufen der Daten.";
+    }
+
+    return `⚠️ **Fehler**: ${userMessage}\n\n*Details: ${error.message}*`;
   }
 }
